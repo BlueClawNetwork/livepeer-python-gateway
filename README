@@ -149,6 +149,43 @@ job = start_lv2v(
 )
 ```
 
+Call a Live Runner with a multipart upload (an OpenAI-style audio endpoint)
+```python
+from livepeer_gateway import FilePart, MultipartBody, call_runner
+
+result = await call_runner(
+    runner=runner,
+    runner_url=runner.url + "/v1/audio/transcriptions",
+    multipart=MultipartBody(
+        fields={"model": "whisper-large-v3"},
+        files=[FilePart("file", "clip.wav", wav_bytes, "audio/wav")],
+    ),
+    signer_url=signer_url,
+    signer_headers=signer_headers,
+    timeout=120.0,
+)
+text = result.data["text"]
+```
+
+`payload` (JSON) and `multipart` are mutually exclusive. The multipart body is
+held in memory so the same bytes can be re-sent after a 402 payment challenge.
+
+## TLS certificate verification
+
+Every HTTP call the SDK makes verifies the server certificate against the
+system trust store. A local go-livepeer or signer with a self-signed certificate
+fails with a `LivepeerGatewayError` whose message contains `certificate`. Opt
+out for such a stack with one line in the environment:
+
+```bash
+export LIVEPEER_GATEWAY_VERIFY_TLS=0   # "0", "false" or "no" disable verification
+```
+
+or per call with `verify_tls=False` (`call_runner`, `discover_runners`,
+`discover_orchestrator_runners`, `get_signer_info`, `LivePaymentSession`,
+`submit_byoc_job`). The per-call argument overrides the environment, which
+sets `livepeer_gateway.http.DEFAULT_VERIFY_TLS` once at import.
+
 ## Token schema (base64-encoded JSON object)
 
 | Field | Type | Description |

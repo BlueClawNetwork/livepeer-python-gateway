@@ -60,6 +60,7 @@ from .live_runner import (
     stop_runner_session,
 )
 from .discovery import discover_orchestrators, discover_runners
+from .multipart import FilePart, MultipartBody
 from .orch_info import get_orch_info
 from .remote_signer import LivePaymentChallenge, LivePaymentSession, PaymentSession
 from .scope import start_scope
@@ -109,6 +110,8 @@ __all__ = [
     "LiveRunnerSessionEvent",
     "LivePaymentChallenge",
     "LivePaymentSession",
+    "FilePart",
+    "MultipartBody",
     "LiveRunnerProxy",
     "LivepeerGatewayError",
     "LivepeerHTTPError",

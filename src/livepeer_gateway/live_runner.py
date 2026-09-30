@@ -28,7 +28,8 @@ from aiohttp.helpers import parse_mimetype
 
 from .channel_reader import ChannelReader
 from .errors import LivepeerGatewayError, LivepeerHTTPError, SignerRefreshRequired
-from .http import _post_empty, _request_body, open_stream, post_json, request_json
+from .http import _post_empty, _request_body, _tls_kwargs, open_stream, post_json, request_json
+from .multipart import MultipartBody
 from .remote_signer import (
     GetPaymentResponse,
     LivePaymentChallenge,
@@ -42,6 +43,7 @@ _LOG = logging.getLogger(__name__)
 _DEFAULT_HEARTBEAT_INTERVAL_S = 5.0
 _LIVE_RUNNER_PAYER_ADDRESS_HEADER = "Livepeer-Payer-Address"
 _LIVE_RUNNER_MODES = frozenset({"persistent", "single-shot"})
+_MULTIPART_METHODS = frozenset({"POST", "PUT"})
 _RUNNER_PAYMENT_TYPES_BY_UNIT = {
     "hour": "live",
     "seconds": "live",
@@ -196,6 +198,9 @@ class LiveRunnerCallStream:
     _response: aiohttp.ClientResponse = field(repr=False, compare=False)
     # True once the orchestrator reported the backing session gone.
     released: bool = False
+    # The payment challenge's manifest_id, as LiveRunnerCallResult.session_id
+    # carries it for a unary call; "" when no challenge was answered.
+    session_id: str = ""
     _payment_task: asyncio.Task[None] | None = field(
         default=None, repr=False, compare=False
     )
@@ -762,12 +767,14 @@ async def call_runner(
     *,
     runner: LiveRunnerInstance | None = ...,
     payload: dict[str, Any] | None = ...,
+    multipart: MultipartBody | None = ...,
     method: str = ...,
     signer_url: str | None = ...,
     signer_headers: dict[str, str] | None = ...,
     payment_unit: str | None = ...,
     timeout: float = ...,
     max_payment_challenge_retries: int = ...,
+    verify_tls: bool | None = ...,
     stream: Literal[False] = False,
 ) -> LiveRunnerCallResult:
     pass
@@ -779,12 +786,14 @@ async def call_runner(
     *,
     runner: LiveRunnerInstance | None = ...,
     payload: dict[str, Any] | None = ...,
+    multipart: MultipartBody | None = ...,
     method: str = ...,
     signer_url: str | None = ...,
     signer_headers: dict[str, str] | None = ...,
     payment_unit: str | None = ...,
     timeout: float = ...,
     max_payment_challenge_retries: int = ...,
+    verify_tls: bool | None = ...,
     stream: Literal[True],
 ) -> LiveRunnerCallStream:
     pass
@@ -795,38 +804,66 @@ async def call_runner(
     *,
     runner: LiveRunnerInstance | None = None,
     payload: dict[str, Any] | None = None,
+    multipart: MultipartBody | None = None,
     method: str = "POST",
     signer_url: str | None = None,
     signer_headers: dict[str, str] | None = None,
     payment_unit: str | None = None,
     timeout: float = 5.0,
     max_payment_challenge_retries: int = 3,
+    verify_tls: bool | None = None,
     stream: bool = False,
 ) -> LiveRunnerCallResult | LiveRunnerCallStream:
     """Call a runner once and return its result (or a live stream if ``stream=True``).
 
     With ``signer_url`` set, payment is automatic and **per call**: a 402 challenge is
     paid via the signer and retried (up to ``max_payment_challenge_retries``), one job,
-    one upfront payment. Raises ``LivepeerHTTPError`` on non-402 errors.
+    one upfront payment. Raises ``LivepeerHTTPError`` on non-402 errors. Every error
+    raised from here carries ``payment_sent``: True when the failed attempt already
+    carried ``Livepeer-Payment`` headers, so a gateway knows whether it may still try
+    another runner.
+
+    The body is either ``payload`` (JSON, ``{}`` when omitted) or ``multipart`` (a
+    ``MultipartBody``, POST or PUT only), never both. A multipart body is held in
+    memory and re-sent byte for byte after a 402 challenge.
 
     ``application/json`` and ``+json`` types parse into ``result.data``; anything else
     (an image, ndjson) comes back unparsed in ``result.content`` + ``result.content_type``.
 
     The request asks for no particular format, so the app picks what it returns.
+
+    ``verify_tls`` overrides ``livepeer_gateway.http.DEFAULT_VERIFY_TLS`` for every
+    HTTP call this makes (signer, runner, payments); the default verifies
+    certificates unless ``LIVEPEER_GATEWAY_VERIFY_TLS=0`` is set.
     """
     runner_url = runner_url.strip() or (runner.url.strip() if runner is not None else "")
     if not runner_url:
         raise LivepeerGatewayError("Live runner call requires runner_url")
-    request_payload = payload or {}
+    if multipart is not None:
+        if payload is not None:
+            raise LivepeerGatewayError("call_runner accepts payload or multipart, not both")
+        if method.upper() not in _MULTIPART_METHODS:
+            raise LivepeerGatewayError(
+                f"call_runner multipart requires method POST or PUT, got {method!r}"
+            )
+    # A JSON call always carries a body ({} when the caller gave none); a multipart
+    # call carries the multipart body instead. Only explicitly set options are
+    # forwarded, so the HTTP layer's defaults apply otherwise.
+    tls_kwargs = _tls_kwargs(verify_tls)
+    body_kwargs: dict[str, Any] = {"payload": None if multipart is not None else (payload or {})}
+    if multipart is not None:
+        body_kwargs["multipart"] = multipart
+    body_kwargs.update(tls_kwargs)
     payment_type = _runner_payment_type(runner, payment_unit) if signer_url else ""
     max_price: LiveRunnerPriceInfo | None = None
     if signer_url and runner is not None and runner.price_info is not None:
         max_price = _pad_runner_price(runner.price_info)
     payer_address = ""
     if signer_url:
-        signer = await get_signer_info(signer_url, _freeze_headers(signer_headers))
+        signer = await get_signer_info(signer_url, _freeze_headers(signer_headers), **tls_kwargs)
         payer_address = cast(str, signer.address)
     challenge: LivePaymentChallenge | None = None
+    any_payment_sent = False
     attempts = (max(0, int(max_payment_challenge_retries)) + 1) * 2
     for attempt in range(attempts):
         payment_session: LivePaymentSession | None = None
@@ -847,6 +884,7 @@ async def call_runner(
                     signer_url=signer_url or "",
                     signer_headers=signer_headers,
                     max_price=max_price,
+                    verify_tls=verify_tls,
                 )
             except SignerRefreshRequired as e:
                 if attempt + 1 >= attempts:
@@ -865,6 +903,9 @@ async def call_runner(
             # Metered pricing bills for as long as the work runs.
             needs_ongoing_funding = payment_type in _METERED_PAYMENT_TYPES
 
+        # Once tickets go out with the request, the call is bound to this runner.
+        payment_sent = "Livepeer-Payment" in request_headers
+        any_payment_sent = any_payment_sent or payment_sent
         try:
             request_kwargs: dict[str, Any] = {"timeout": timeout}
             if request_headers:
@@ -876,8 +917,8 @@ async def call_runner(
                 session, resp = await open_stream(
                     runner_url,
                     method=method,
-                    payload=request_payload,
                     headers=request_headers or None,
+                    **body_kwargs,
                 )
                 call_stream = LiveRunnerCallStream(
                     resp.status,
@@ -887,6 +928,7 @@ async def call_runner(
                     None if payment_type == "fixed" else payment_session,
                     session,
                     resp,
+                    session_id=session_id,
                 )
                 # The stream outlives this call, so it owns the funding.
                 if needs_ongoing_funding:
@@ -903,7 +945,7 @@ async def call_runner(
                 body, content_type = await _request_body(
                     runner_url,
                     method=method,
-                    payload=request_payload,
+                    **body_kwargs,
                     **request_kwargs,
                 )
             finally:
@@ -937,13 +979,23 @@ async def call_runner(
             )
         except LivepeerHTTPError as e:
             if e.status_code != 402:
+                e.payment_sent = payment_sent
                 raise
             if not signer_url:
                 raise LivepeerGatewayError("Live runner paid call requires signer_url") from e
-            challenge = _parse_runner_payment_challenge(e)
+            try:
+                challenge = _parse_runner_payment_challenge(e)
+            except LivepeerGatewayError as parse_error:
+                parse_error.payment_sent = payment_sent
+                raise
             continue
+        except LivepeerGatewayError as e:
+            e.payment_sent = payment_sent
+            raise
 
-    raise LivepeerGatewayError("Live runner call exhausted payment challenge retries")
+    exhausted = LivepeerGatewayError("Live runner call exhausted payment challenge retries")
+    exhausted.payment_sent = any_payment_sent
+    raise exhausted
 
 
 def _parse_runner_payment_challenge(error: LivepeerHTTPError) -> LivePaymentChallenge:
@@ -1002,6 +1054,7 @@ async def _get_runner_payment(
     signer_headers: dict[str, str] | None,
     max_price: LiveRunnerPriceInfo | None,
     app: str | None = None,
+    verify_tls: bool | None = None,
 ) -> tuple[LivePaymentSession, GetPaymentResponse]:
     session = LivePaymentSession(
         signer_url=signer_url,
@@ -1010,6 +1063,7 @@ async def _get_runner_payment(
         challenge=challenge,
         app=app,
         max_price=max_price.to_json() if max_price is not None else None,
+        **_tls_kwargs(verify_tls),
     )
     payment = await session.get_payment()
     if not payment.payment:

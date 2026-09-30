@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import email.parser
 import json
 import os
+import socket
 import sys
+from collections.abc import AsyncIterator, Iterator
 from types import SimpleNamespace
 from unittest import mock
 
 import pytest
+from aiohttp import web
 
 from livepeer_gateway import live_runner
 from livepeer_gateway.errors import (
@@ -26,6 +31,7 @@ from livepeer_gateway.live_runner import (
     stop_runner_session,
     create_proxy,
 )
+from livepeer_gateway.multipart import FilePart, MultipartBody
 from livepeer_gateway.remote_signer import LivePaymentChallenge
 
 
@@ -1833,3 +1839,303 @@ class TestLiveRunnerGPU:
             gpu = live_runner._detect_gpu_torch()
 
         assert gpu == LiveRunnerGPU(id="1", name="Torch GPU", vram_mb=32)
+
+
+# ---------------------------------------------------------------------------
+# call_runner against a real runner: multipart bodies, stream manifest ids, and
+# whether payment was sent when a call fails. The signer is faked; the runner
+# is a real aiohttp application on an ephemeral port.
+# ---------------------------------------------------------------------------
+
+
+
+
+_WAV_BYTES = b"RIFF\x24\x00\x00\x00WAVEfmt " + bytes(range(256)) * 4
+
+
+def _multipart_body() -> MultipartBody:
+    return MultipartBody(
+        fields={"model": "whisper-large-v3"},
+        files=[FilePart("file", "clip.wav", _WAV_BYTES, "audio/wav")],
+    )
+
+
+def _parse_multipart(content_type: str, body: bytes) -> dict[str, email.message.Message]:
+    message = email.parser.BytesParser().parsebytes(
+        f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode() + body
+    )
+    assert message.is_multipart()
+    return {
+        part.get_param("name", header="content-disposition"): part
+        for part in message.get_payload()
+    }
+
+
+@contextlib.asynccontextmanager
+async def _serve(app: web.Application) -> AsyncIterator[str]:
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]  # type: ignore[union-attr]
+    try:
+        yield f"http://127.0.0.1:{port}"
+    finally:
+        await runner.cleanup()
+
+
+class _RecordedRequest:
+    def __init__(self, request: web.Request, body: bytes) -> None:
+        self.path = request.path
+        self.method = request.method
+        self.headers = dict(request.headers)
+        self.body = body
+
+
+class _FakePaymentSession:
+    """Stands in for LivePaymentSession: returns fixed tickets, funds forever."""
+
+    instances: list[_FakePaymentSession] = []
+
+    def __init__(self, signer_url: str, **kwargs: object) -> None:
+        self.signer_url = signer_url
+        self.kwargs = kwargs
+        type(self).instances.append(self)
+
+    async def get_payment(self) -> object:
+        return SimpleNamespace(payment="payment-b64", seg_creds="seg-b64")
+
+    async def run_payments(self) -> bool:
+        await asyncio.Event().wait()
+        return False
+
+
+@contextlib.contextmanager
+def _fake_signer() -> Iterator[None]:
+    _FakePaymentSession.instances = []
+    with (
+        mock.patch.object(live_runner, "LivePaymentSession", _FakePaymentSession),
+        mock.patch.object(
+            live_runner,
+            "get_signer_info",
+            new_callable=mock.AsyncMock,
+            return_value=SimpleNamespace(address="opaque-payer", sig="opaque-signature"),
+        ),
+    ):
+        yield
+
+
+def _runner_app(
+    seen: list[_RecordedRequest],
+    *,
+    statuses: list[int] | None = None,
+    stream: bool = False,
+) -> web.Application:
+    """A runner that answers each request with the next status in ``statuses``.
+
+    402 carries a payment challenge; 200 echoes the parsed multipart (or JSON)
+    body, as JSON or as two SSE frames when ``stream`` is set.
+    """
+    pending = list(statuses or [200])
+
+    async def handler(request: web.Request) -> web.StreamResponse:
+        body = await request.read()
+        seen.append(_RecordedRequest(request, body))
+        status = pending.pop(0) if len(pending) > 1 else pending[0]
+        if status == 402:
+            return web.Response(
+                status=402,
+                text=_payment_challenge_body("manifest-1"),
+                content_type="application/json",
+            )
+        if status != 200:
+            return web.Response(status=status, text="no")
+        if stream:
+            resp = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+            await resp.prepare(request)
+            await resp.write(b"data: one\n\n")
+            await resp.write(b"data: two\n\n")
+            await resp.write_eof()
+            return resp
+        return web.json_response({"text": "hello", "n": len(seen)})
+
+    app = web.Application()
+    app.router.add_route("*", "/call", handler)
+    return app
+
+
+def _free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+class TestCallRunnerMultipart:
+    async def test_multipart_reaches_runner(self) -> None:
+        seen: list[_RecordedRequest] = []
+        async with _serve(_runner_app(seen)) as base:
+            result = await call_runner(f"{base}/call", multipart=_multipart_body())
+
+        assert result.data == {"text": "hello", "n": 1}
+        assert result.session_id == ""
+        [request] = seen
+        assert request.method == "POST"
+        assert request.headers["Content-Type"].startswith("multipart/form-data; boundary=")
+        assert request.headers["Accept"] == "*/*"
+        parts = _parse_multipart(request.headers["Content-Type"], request.body)
+        assert parts["model"].get_payload(decode=True) == b"whisper-large-v3"
+        assert parts["file"].get_filename() == "clip.wav"
+        assert parts["file"].get_content_type() == "audio/wav"
+        assert parts["file"].get_payload(decode=True) == _WAV_BYTES
+
+    async def test_multipart_survives_payment_retry(self) -> None:
+        seen: list[_RecordedRequest] = []
+        async with _serve(_runner_app(seen, statuses=[402, 200])) as base:
+            with _fake_signer():
+                result = await call_runner(
+                    f"{base}/call",
+                    multipart=_multipart_body(),
+                    signer_url="https://signer.example.com",
+                    signer_headers={"Authorization": "token"},
+                    payment_unit="seconds",
+                )
+
+        assert result.data == {"text": "hello", "n": 2}
+        assert result.session_id == "manifest-1"
+        first, second = seen
+        assert first.body == second.body
+        assert first.headers["Content-Type"] == second.headers["Content-Type"]
+        assert "Livepeer-Payment" not in first.headers
+        assert second.headers["Livepeer-Payment"] == "payment-b64"
+        assert second.headers["Livepeer-Segment"] == "seg-b64"
+        assert second.headers["Livepeer-Payer-Address"] == "opaque-payer"
+        assert _FakePaymentSession.instances[0].kwargs["challenge"] == _payment_challenge("manifest-1")
+        assert result.payment_session is _FakePaymentSession.instances[0]
+
+    async def test_multipart_with_stream(self) -> None:
+        seen: list[_RecordedRequest] = []
+        async with _serve(_runner_app(seen, stream=True)) as base:
+            async with await call_runner(
+                f"{base}/call", multipart=_multipart_body(), stream=True
+            ) as stream:
+                assert stream.content_type == "text/event-stream"
+                lines = [line async for line in stream.aiter_lines() if line]
+
+        assert lines == ["data: one", "data: two"]
+        [request] = seen
+        parts = _parse_multipart(request.headers["Content-Type"], request.body)
+        assert parts["file"].get_payload(decode=True) == _WAV_BYTES
+
+    async def test_multipart_with_put(self) -> None:
+        seen: list[_RecordedRequest] = []
+        async with _serve(_runner_app(seen)) as base:
+            await call_runner(f"{base}/call", multipart=_multipart_body(), method="put")
+        assert seen[0].method == "PUT"
+
+    async def test_payload_and_multipart_are_mutually_exclusive(self) -> None:
+        seen: list[_RecordedRequest] = []
+        async with _serve(_runner_app(seen)) as base:
+            with pytest.raises(LivepeerGatewayError, match="payload or multipart, not both"):
+                await call_runner(f"{base}/call", payload={"x": 1}, multipart=_multipart_body())
+            with pytest.raises(LivepeerGatewayError, match="POST or PUT"):
+                await call_runner(f"{base}/call", multipart=_multipart_body(), method="GET")
+        assert seen == []
+
+
+class TestCallRunnerStreamSessionId:
+    async def test_stream_carries_manifest_id(self) -> None:
+        seen: list[_RecordedRequest] = []
+        async with _serve(_runner_app(seen, statuses=[402, 200], stream=True)) as base:
+            with _fake_signer():
+                async with await call_runner(
+                    f"{base}/call",
+                    payload={"prompt": "hi"},
+                    signer_url="https://signer.example.com",
+                    payment_unit="seconds",
+                    stream=True,
+                ) as stream:
+                    assert stream.session_id == "manifest-1"
+                    assert stream.payment_session is _FakePaymentSession.instances[0]
+                    lines = [line async for line in stream.aiter_lines() if line]
+
+        assert lines == ["data: one", "data: two"]
+        assert len(seen) == 2
+
+    async def test_stream_without_signer_has_empty_session_id(self) -> None:
+        seen: list[_RecordedRequest] = []
+        async with _serve(_runner_app(seen, stream=True)) as base:
+            async with await call_runner(f"{base}/call", payload={}, stream=True) as stream:
+                assert stream.session_id == ""
+
+
+class TestCallRunnerPaymentSent:
+    async def test_error_after_payment_says_so(self) -> None:
+        seen: list[_RecordedRequest] = []
+        async with _serve(_runner_app(seen, statuses=[402, 500])) as base:
+            with _fake_signer():
+                with pytest.raises(LivepeerHTTPError) as info:
+                    await call_runner(
+                        f"{base}/call",
+                        payload={"prompt": "hi"},
+                        signer_url="https://signer.example.com",
+                        payment_unit="seconds",
+                    )
+        assert info.value.status_code == 500
+        assert info.value.payment_sent is True
+        assert len(seen) == 2
+
+    async def test_error_before_payment_says_so(self) -> None:
+        seen: list[_RecordedRequest] = []
+        async with _serve(_runner_app(seen, statuses=[503])) as base:
+            with _fake_signer():
+                with pytest.raises(LivepeerHTTPError) as info:
+                    await call_runner(
+                        f"{base}/call",
+                        payload={"prompt": "hi"},
+                        signer_url="https://signer.example.com",
+                        payment_unit="seconds",
+                    )
+        assert info.value.status_code == 503
+        assert info.value.payment_sent is False
+        assert len(seen) == 1
+
+    async def test_connection_refused_before_challenge(self) -> None:
+        with pytest.raises(LivepeerGatewayError, match="connection refused") as info:
+            await call_runner(f"http://127.0.0.1:{_free_port()}/call", payload={"prompt": "hi"})
+        assert info.value.payment_sent is False
+
+    async def test_stream_error_after_payment_says_so(self) -> None:
+        seen: list[_RecordedRequest] = []
+        async with _serve(_runner_app(seen, statuses=[402, 500])) as base:
+            with _fake_signer():
+                with pytest.raises(LivepeerHTTPError) as info:
+                    await call_runner(
+                        f"{base}/call",
+                        payload={"prompt": "hi"},
+                        signer_url="https://signer.example.com",
+                        payment_unit="seconds",
+                        stream=True,
+                    )
+        assert info.value.status_code == 500
+        assert info.value.payment_sent is True
+
+    async def test_exhausted_retries_after_payment_says_so(self) -> None:
+        seen: list[_RecordedRequest] = []
+        async with _serve(_runner_app(seen, statuses=[402])) as base:
+            with _fake_signer():
+                with pytest.raises(LivepeerGatewayError, match="exhausted") as info:
+                    await call_runner(
+                        f"{base}/call",
+                        payload={"prompt": "hi"},
+                        signer_url="https://signer.example.com",
+                        payment_unit="seconds",
+                        max_payment_challenge_retries=1,
+                    )
+        assert info.value.payment_sent is True
+
+    async def test_paid_call_without_signer_is_unpaid(self) -> None:
+        seen: list[_RecordedRequest] = []
+        async with _serve(_runner_app(seen, statuses=[402])) as base:
+            with pytest.raises(LivepeerGatewayError, match="requires signer_url") as info:
+                await call_runner(f"{base}/call", payload={"prompt": "hi"})
+        assert info.value.payment_sent is False

@@ -5,7 +5,6 @@ import base64
 import json
 import logging
 import re
-import ssl
 from dataclasses import dataclass, replace
 from functools import lru_cache
 from typing import Any, Optional
@@ -196,19 +195,22 @@ async def get_signer_info(
     signer_url: str,
     # frozenset instead of dict because cache keys require hashable arguments.
     _signer_headers: frozenset[tuple[str, str]] | None = None,
+    verify_tls: bool | None = None,
 ) -> SignerMaterial:
     """
     Async-native version of get_orch_info_sig for callers that should not block
     the event loop or use gRPC.
+
+    ``verify_tls`` overrides ``livepeer_gateway.http.DEFAULT_VERIFY_TLS``.
     """
-    from .http import _http_origin, post_json
+    from .http import _http_origin, _tls_kwargs, post_json
 
     if not signer_url:
         return SignerMaterial(address=None, sig=None)
 
     url = f"{_http_origin(signer_url)}/sign-orchestrator-info"
     headers = dict(_signer_headers) if _signer_headers else None
-    data = await post_json(url, {}, headers=headers, timeout=5.0)
+    data = await post_json(url, {}, headers=headers, timeout=5.0, **_tls_kwargs(verify_tls))
     return _signer_material_from_json(data, url)
 
 
@@ -223,6 +225,7 @@ class LivePaymentSession:
         app: str | None = None,
         max_price: dict[str, Any] | None = None,
         max_refresh_retries: int = 3,
+        verify_tls: bool | None = None,
     ) -> None:
         self._signer_url = signer_url
         self._signer_headers = _freeze_headers(signer_headers)
@@ -231,6 +234,8 @@ class LivePaymentSession:
         self._app = app
         self._max_price = dict(max_price) if max_price is not None else None
         self._max_refresh_retries = max(0, int(max_refresh_retries))
+        # None defers to livepeer_gateway.http.DEFAULT_VERIFY_TLS.
+        self._verify_tls = verify_tls
         self._state: dict[str, Any] | None = None
 
     async def get_payment(self) -> GetPaymentResponse:
@@ -260,7 +265,7 @@ class LivePaymentSession:
         if not self._signer_url:
             return
 
-        from .http import _post_empty
+        from .http import _post_empty, _tls_kwargs
 
         payment = await self.get_payment()
         if not payment.seg_creds:
@@ -271,7 +276,12 @@ class LivePaymentSession:
             "Livepeer-Payment": payment.payment,
             "Livepeer-Segment": payment.seg_creds,
         }
-        await _post_empty(self._challenge.payment_url, headers=headers, timeout=5.0)
+        await _post_empty(
+            self._challenge.payment_url,
+            headers=headers,
+            timeout=5.0,
+            **_tls_kwargs(self._verify_tls),
+        )
 
     async def run_payments(self) -> bool:
         """Keep a metered session funded until cancelled or the session ends.
@@ -298,7 +308,7 @@ class LivePaymentSession:
                 _LOG.warning("Payment failed; retrying next cycle: %s", e)
 
     async def _payment_request(self) -> GetPaymentResponse:
-        from .http import _http_origin, post_json
+        from .http import _http_origin, _tls_kwargs, post_json
 
         url = f"{_http_origin(self._signer_url)}/generate-live-payment"
         payload: dict[str, Any] = {
@@ -314,7 +324,7 @@ class LivePaymentSession:
             payload["state"] = self._state
 
         headers = dict(self._signer_headers) if self._signer_headers else None
-        data = await post_json(url, payload, headers=headers)
+        data = await post_json(url, payload, headers=headers, **_tls_kwargs(self._verify_tls))
         payment = data.get("payment")
         if not isinstance(payment, str) or not payment:
             raise PaymentError(
@@ -337,9 +347,10 @@ class LivePaymentSession:
         return GetPaymentResponse(payment=payment, seg_creds=seg_creds)
 
     async def _refresh_payment_params(self) -> None:
-        from .http import _http_origin, post_json
+        from .http import _http_origin, _tls_kwargs, post_json
 
-        signer = await get_signer_info(self._signer_url or "", self._signer_headers)
+        tls_kwargs = _tls_kwargs(self._verify_tls)
+        signer = await get_signer_info(self._signer_url or "", self._signer_headers, **tls_kwargs)
         if not signer.address:
             raise PaymentError("Cannot refresh payment without signer address")
 
@@ -350,6 +361,7 @@ class LivePaymentSession:
                 "sender": signer.address,
                 "manifest_id": self._challenge.manifest_id,
             },
+            **tls_kwargs,
         )
         payment_params = data.get("payment_params")
         if not isinstance(payment_params, str) or not payment_params:
@@ -376,6 +388,7 @@ class PaymentSession:
         capabilities: Optional[lp_rpc_pb2.Capabilities] = None,
         use_tofu: bool = True,
         max_refresh_retries: int = 3,
+        verify_tls: bool | None = None,
     ) -> None:
         self._signer_url = signer_url
         self._signer_headers = signer_headers
@@ -386,6 +399,8 @@ class PaymentSession:
         self._capabilities = capabilities
         self._use_tofu = use_tofu
         self._max_refresh_retries = max(0, int(max_refresh_retries))
+        # None defers to livepeer_gateway.http.DEFAULT_VERIFY_TLS.
+        self._verify_tls = verify_tls
         self._state: Optional[dict[str, str]] = None
 
     def set_manifest_id(self, manifest_id: str) -> None:
@@ -415,7 +430,7 @@ class PaymentSession:
             return GetPaymentResponse(seg_creds=seg, payment="")
 
         def _payment_request() -> GetPaymentResponse:
-            from .http import _http_origin, post_json_sync as post_json
+            from .http import _http_origin, _tls_kwargs, post_json_sync as post_json
 
             base = _http_origin(self._signer_url)
             url = f"{base}/generate-live-payment"
@@ -437,7 +452,9 @@ class PaymentSession:
             if self._state is not None:
                 payload["state"] = self._state
 
-            data = post_json(url, payload, headers=self._signer_headers)
+            data = post_json(
+                url, payload, headers=self._signer_headers, **_tls_kwargs(self._verify_tls)
+            )
             payment = data.get("payment")
             if not isinstance(payment, str) or not payment:
                 raise PaymentError(
@@ -488,7 +505,7 @@ class PaymentSession:
         Generate a payment (via get_payment) and forward it
         to the orchestrator via POST {orch}/payment.
         """
-        from .http import _extract_error_message, _http_origin
+        from .http import _extract_error_message, _http_origin, _urllib_ssl_context
 
         p = self.get_payment()
         if not self._info.transcoder:
@@ -500,7 +517,7 @@ class PaymentSession:
             "Livepeer-Segment": p.seg_creds or "",
         }
         req = Request(url, data=b"", headers=headers, method="POST")
-        ssl_ctx = ssl._create_unverified_context()
+        ssl_ctx = _urllib_ssl_context(self._verify_tls)
         try:
             with urlopen(req, timeout=5.0, context=ssl_ctx) as resp:
                 resp.read()

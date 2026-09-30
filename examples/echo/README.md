@@ -13,9 +13,11 @@ Start go-livepeer:
 ./livepeer -orchestrator -useLiveRunners -serviceAddr localhost:8935 -v 99 -orchSecret abcdef
 ```
 
-Start the runner:
+Start the runner. go-livepeer serves a self-signed certificate, so turn off TLS
+verification for this local stack:
 
 ```sh
+export LIVEPEER_GATEWAY_VERIFY_TLS=0
 uv run examples/echo/runner.py --orchestrator https://localhost:8935 --orchSecret abcdef
 ```
 
