@@ -2082,7 +2082,38 @@ class TestCallRunnerPaymentSent:
                     )
         assert info.value.status_code == 500
         assert info.value.payment_sent is True
+        assert info.value.manifest_id == "manifest-1"
         assert len(seen) == 2
+
+    async def test_rejection_after_payment_carries_the_manifest(self) -> None:
+        seen: list[_RecordedRequest] = []
+        async with _serve(_runner_app(seen, statuses=[402, 400])) as base:
+            with _fake_signer():
+                with pytest.raises(LivepeerHTTPError) as info:
+                    await call_runner(
+                        f"{base}/call",
+                        payload={"prompt": "hi"},
+                        signer_url="https://signer.example.com",
+                        payment_unit="seconds",
+                    )
+        assert info.value.status_code == 400
+        assert info.value.payment_sent is True
+        assert info.value.manifest_id == "manifest-1"
+
+    async def test_rejection_before_payment_has_no_manifest(self) -> None:
+        seen: list[_RecordedRequest] = []
+        async with _serve(_runner_app(seen, statuses=[400])) as base:
+            with _fake_signer():
+                with pytest.raises(LivepeerHTTPError) as info:
+                    await call_runner(
+                        f"{base}/call",
+                        payload={"prompt": "hi"},
+                        signer_url="https://signer.example.com",
+                        payment_unit="seconds",
+                    )
+        assert info.value.status_code == 400
+        assert info.value.payment_sent is False
+        assert info.value.manifest_id == ""
 
     async def test_error_before_payment_says_so(self) -> None:
         seen: list[_RecordedRequest] = []
@@ -2097,6 +2128,7 @@ class TestCallRunnerPaymentSent:
                     )
         assert info.value.status_code == 503
         assert info.value.payment_sent is False
+        assert info.value.manifest_id == ""
         assert len(seen) == 1
 
     async def test_connection_refused_before_challenge(self) -> None:
@@ -2118,6 +2150,7 @@ class TestCallRunnerPaymentSent:
                     )
         assert info.value.status_code == 500
         assert info.value.payment_sent is True
+        assert info.value.manifest_id == "manifest-1"
 
     async def test_exhausted_retries_after_payment_says_so(self) -> None:
         seen: list[_RecordedRequest] = []
@@ -2132,6 +2165,7 @@ class TestCallRunnerPaymentSent:
                         max_payment_challenge_retries=1,
                     )
         assert info.value.payment_sent is True
+        assert info.value.manifest_id != ""
 
     async def test_paid_call_without_signer_is_unpaid(self) -> None:
         seen: list[_RecordedRequest] = []

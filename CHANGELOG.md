@@ -41,6 +41,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `call_runner` raises from an attempt whose request already carried
   `Livepeer-Payment` headers. A gateway may fail over to another runner only
   while it is `False`.
+- `LivepeerGatewayError.manifest_id` is the answered payment challenge's
+  `manifest_id` when `payment_sent` is `True`, and `""` otherwise, so a
+  gateway can attribute the network cost of a paid call that failed.
 
 ## [1.0.0] - 2026-08-11
 

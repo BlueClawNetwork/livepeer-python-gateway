@@ -864,6 +864,7 @@ async def call_runner(
         payer_address = cast(str, signer.address)
     challenge: LivePaymentChallenge | None = None
     any_payment_sent = False
+    paid_manifest_id = ""
     attempts = (max(0, int(max_payment_challenge_retries)) + 1) * 2
     for attempt in range(attempts):
         payment_session: LivePaymentSession | None = None
@@ -906,6 +907,8 @@ async def call_runner(
         # Once tickets go out with the request, the call is bound to this runner.
         payment_sent = "Livepeer-Payment" in request_headers
         any_payment_sent = any_payment_sent or payment_sent
+        if payment_sent:
+            paid_manifest_id = session_id
         try:
             request_kwargs: dict[str, Any] = {"timeout": timeout}
             if request_headers:
@@ -980,6 +983,7 @@ async def call_runner(
         except LivepeerHTTPError as e:
             if e.status_code != 402:
                 e.payment_sent = payment_sent
+                e.manifest_id = session_id
                 raise
             if not signer_url:
                 raise LivepeerGatewayError("Live runner paid call requires signer_url") from e
@@ -987,14 +991,17 @@ async def call_runner(
                 challenge = _parse_runner_payment_challenge(e)
             except LivepeerGatewayError as parse_error:
                 parse_error.payment_sent = payment_sent
+                parse_error.manifest_id = session_id
                 raise
             continue
         except LivepeerGatewayError as e:
             e.payment_sent = payment_sent
+            e.manifest_id = session_id
             raise
 
     exhausted = LivepeerGatewayError("Live runner call exhausted payment challenge retries")
     exhausted.payment_sent = any_payment_sent
+    exhausted.manifest_id = paid_manifest_id
     raise exhausted
 
 
