@@ -4,7 +4,20 @@ from dataclasses import dataclass
 
 
 class LivepeerGatewayError(RuntimeError):
-    """Base error for the library."""
+    """Base error for the library.
+
+    ``payment_sent`` is True when the error comes from a ``call_runner`` attempt
+    whose request carried ``Livepeer-Payment`` headers, that is, after a payment
+    challenge had already been answered. A gateway may retry another runner only
+    while it is False; once tickets are sent the request is bound to that runner.
+
+    ``manifest_id`` is the answered payment challenge's ``manifest_id`` when
+    ``payment_sent`` is True, and ``""`` otherwise, so a gateway can attribute
+    the cost of a paid call that failed.
+    """
+
+    payment_sent: bool = False
+    manifest_id: str = ""
 
 
 class LivepeerHTTPError(LivepeerGatewayError):

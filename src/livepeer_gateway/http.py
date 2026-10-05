@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import ssl
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -15,8 +16,46 @@ from .errors import (
     SignerRefreshRequired,
     SkipPaymentCycle,
 )
+from .multipart import MultipartBody, encode_multipart
 
 _REFRESH_SESSION_ORCHESTRATOR_URL_HEADER = "Livepeer-Orchestrator-URL"
+
+VERIFY_TLS_ENV = "LIVEPEER_GATEWAY_VERIFY_TLS"
+_FALSE_VALUES = frozenset({"0", "false", "no"})
+
+
+def _verify_tls_from_env() -> bool:
+    """Read ``LIVEPEER_GATEWAY_VERIFY_TLS``: ``0``, ``false`` or ``no`` disable verification."""
+    return os.environ.get(VERIFY_TLS_ENV, "").strip().lower() not in _FALSE_VALUES
+
+
+# Process-wide default for TLS certificate verification. Every HTTP call the SDK
+# makes verifies certificates against the system trust store unless this is False
+# or the call passes ``verify_tls=False``. Self-signed local stacks set
+# ``LIVEPEER_GATEWAY_VERIFY_TLS=0`` in their environment.
+DEFAULT_VERIFY_TLS: bool = _verify_tls_from_env()
+
+
+def _resolve_verify_tls(verify_tls: bool | None) -> bool:
+    """A per-call ``verify_tls`` argument overrides the module default; None means default."""
+    return DEFAULT_VERIFY_TLS if verify_tls is None else bool(verify_tls)
+
+
+def _tls_kwargs(verify_tls: bool | None) -> dict[str, bool]:
+    """Forward an explicit ``verify_tls`` argument, and nothing when the default applies."""
+    return {} if verify_tls is None else {"verify_tls": verify_tls}
+
+
+def _aiohttp_ssl(verify_tls: bool | None) -> None | bool:
+    """``ssl=`` value for ``aiohttp.TCPConnector``: None (aiohttp default, system trust store) or False."""
+    return None if _resolve_verify_tls(verify_tls) else False
+
+
+def _urllib_ssl_context(verify_tls: bool | None) -> ssl.SSLContext:
+    """``context=`` for ``urllib.request.urlopen``: the default verifying context, or an unverified one."""
+    if _resolve_verify_tls(verify_tls):
+        return ssl.create_default_context()
+    return ssl._create_unverified_context()
 
 
 def _truncate(s: str, max_len: int = 2000) -> str:
@@ -83,26 +122,41 @@ def _header_value(headers: dict[str, str], name: str) -> str | None:
     return None
 
 
-def _json_request_parts(
+def _request_parts(
     url: str,
     *,
     method: str | None = None,
     payload: dict[str, Any] | None = None,
+    multipart: MultipartBody | None = None,
     headers: dict[str, str] | None = None,
 ) -> tuple[str, dict[str, str], bytes | None]:
-    req_headers: dict[str, str] = {
-        "Accept": "application/json",
-        "User-Agent": "livepeer-python-gateway/0.1",
-    }
+    """Resolve ``(method, headers, body)`` for a request.
+
+    ``payload`` is JSON-encoded with ``Content-Type: application/json`` and
+    ``Accept: application/json``. ``multipart`` is encoded as
+    ``multipart/form-data`` (the boundary is fixed per ``MultipartBody``, so a
+    retry sends byte-identical bytes) and sets no ``Accept``; the app picks the
+    response format. ``headers`` override anything set here.
+    """
+    req_headers: dict[str, str] = {"User-Agent": "livepeer-python-gateway/0.1"}
     body: bytes | None = None
-    if payload is not None:
-        req_headers["Content-Type"] = "application/json"
-        body = json.dumps(payload).encode("utf-8")
+    if multipart is not None:
+        req_headers["Content-Type"] = multipart.content_type
+        body = encode_multipart(multipart)
+    else:
+        req_headers["Accept"] = "application/json"
+        if payload is not None:
+            req_headers["Content-Type"] = "application/json"
+            body = json.dumps(payload).encode("utf-8")
     if headers:
         req_headers.update(headers)
 
-    resolved_method = method.upper() if method else ("POST" if payload is not None else "GET")
+    resolved_method = method.upper() if method else ("POST" if body is not None else "GET")
     return resolved_method, req_headers, body
+
+
+# Name kept for callers that imported the JSON-only helper.
+_json_request_parts = _request_parts
 
 
 def _raise_http_json_error(
@@ -145,24 +199,24 @@ def request_json_sync(
     payload: dict[str, Any] | None = None,
     headers: dict[str, str] | None = None,
     timeout: float = 5.0,
+    verify_tls: bool | None = None,
 ) -> Any:
     """
     Make a JSON HTTP request and parse the JSON response.
 
     If method is None, defaults to POST when payload is provided, otherwise GET.
+    ``verify_tls`` overrides ``DEFAULT_VERIFY_TLS`` for this call.
 
     Raises LivepeerGatewayError on HTTP/network/JSON parsing errors.
     """
-    resolved_method, req_headers, body = _json_request_parts(
+    resolved_method, req_headers, body = _request_parts(
         url,
         method=method,
         payload=payload,
         headers=headers,
     )
     req = Request(url, data=body, headers=req_headers, method=resolved_method)
-
-    # Always ignore HTTPS certificate validation (matches our gRPC behavior).
-    ssl_ctx = ssl._create_unverified_context()
+    ssl_ctx = _urllib_ssl_context(verify_tls)
 
     try:
         with urlopen(req, timeout=timeout, context=ssl_ctx) as resp:
@@ -214,6 +268,7 @@ def post_json_sync(
     *,
     headers: dict[str, str] | None = None,
     timeout: float = 5.0,
+    verify_tls: bool | None = None,
 ) -> dict[str, Any]:
     """
     POST JSON to `url` and parse a JSON object response.
@@ -223,6 +278,7 @@ def post_json_sync(
         payload=payload,
         headers=headers,
         timeout=timeout,
+        verify_tls=verify_tls,
     )
     return _ensure_json_object(data, url=url)
 
@@ -232,11 +288,12 @@ def get_json_sync(
     *,
     headers: dict[str, str] | None = None,
     timeout: float = 5.0,
+    verify_tls: bool | None = None,
 ) -> Any:
     """
     GET JSON from `url` and parse the response.
     """
-    return request_json_sync(url, headers=headers, timeout=timeout)
+    return request_json_sync(url, headers=headers, timeout=timeout, verify_tls=verify_tls)
 
 
 async def _request_body(
@@ -244,29 +301,34 @@ async def _request_body(
     *,
     method: str | None = None,
     payload: dict[str, Any] | None = None,
+    multipart: MultipartBody | None = None,
     headers: dict[str, str] | None = None,
     timeout: float = 5.0,
+    verify_tls: bool | None = None,
 ) -> tuple[bytes, str]:
     """
-    Make an async JSON-payload HTTP request and return the raw response body.
+    Make an async HTTP request (JSON ``payload`` or ``multipart`` body) and return
+    the raw response body.
 
     Returns ``(body, content_type)`` without assuming the response is JSON;
     request semantics and error mapping match request_json.
 
-    If method is None, defaults to POST when payload is provided, otherwise GET.
+    If method is None, defaults to POST when a body is provided, otherwise GET.
+    ``verify_tls`` overrides ``DEFAULT_VERIFY_TLS`` for this call.
 
     Raises LivepeerGatewayError on HTTP/network errors.
     """
-    resolved_method, req_headers, body = _json_request_parts(
+    resolved_method, req_headers, body = _request_parts(
         url,
         method=method,
         payload=payload,
+        multipart=multipart,
         headers=headers,
     )
 
     try:
         client_timeout = aiohttp.ClientTimeout(total=timeout)
-        connector = aiohttp.TCPConnector(ssl=False)
+        connector = aiohttp.TCPConnector(ssl=_aiohttp_ssl(verify_tls))
         async with aiohttp.ClientSession(timeout=client_timeout, connector=connector) as session:
             async with session.request(resolved_method, url, data=body, headers=req_headers) as resp:
                 raw = await resp.read()
@@ -309,11 +371,13 @@ async def request_json(
     payload: dict[str, Any] | None = None,
     headers: dict[str, str] | None = None,
     timeout: float = 5.0,
+    verify_tls: bool | None = None,
 ) -> Any:
     """
     Make an async JSON HTTP request and parse the JSON response.
 
     If method is None, defaults to POST when payload is provided, otherwise GET.
+    ``verify_tls`` overrides ``DEFAULT_VERIFY_TLS`` for this call.
 
     Raises LivepeerGatewayError on HTTP/network/JSON parsing errors.
     """
@@ -323,6 +387,7 @@ async def request_json(
         payload=payload,
         headers=headers,
         timeout=timeout,
+        verify_tls=verify_tls,
     )
     try:
         return json.loads(raw)
@@ -337,8 +402,10 @@ async def open_stream(
     *,
     method: str | None = None,
     payload: dict[str, Any] | None = None,
+    multipart: MultipartBody | None = None,
     headers: dict[str, str] | None = None,
     connect_timeout: float = 10.0,
+    verify_tls: bool | None = None,
 ) -> tuple[aiohttp.ClientSession, aiohttp.ClientResponse]:
     """
     Open an HTTP request and return the live (session, response) without reading the
@@ -346,17 +413,21 @@ async def open_stream(
     them.
 
     No total timeout (streams run indefinitely) only connect/first-byte are bounded.
+    ``verify_tls`` overrides ``DEFAULT_VERIFY_TLS`` for this call.
     Raises LivepeerHTTPError on >= 400 (e.g. the 402 payment retry).
     """
-    resolved_method, req_headers, body = _json_request_parts(
+    resolved_method, req_headers, body = _request_parts(
         url,
         method=method,
         payload=payload,
+        multipart=multipart,
         headers=headers,
     )
 
     timeout = aiohttp.ClientTimeout(total=None, sock_connect=connect_timeout, sock_read=None)
-    session = aiohttp.ClientSession(timeout=timeout, connector=aiohttp.TCPConnector(ssl=False))
+    session = aiohttp.ClientSession(
+        timeout=timeout, connector=aiohttp.TCPConnector(ssl=_aiohttp_ssl(verify_tls))
+    )
     try:
         resp = await session.request(resolved_method, url, data=body, headers=req_headers)
     except (TimeoutError, aiohttp.ClientError) as e:
@@ -378,6 +449,7 @@ async def post_json(
     *,
     headers: dict[str, str] | None = None,
     timeout: float = 5.0,
+    verify_tls: bool | None = None,
 ) -> dict[str, Any]:
     """
     POST JSON to `url` and parse a JSON object response.
@@ -387,6 +459,7 @@ async def post_json(
         payload=payload,
         headers=headers,
         timeout=timeout,
+        verify_tls=verify_tls,
     )
     return _ensure_json_object(data, url=url)
 
@@ -396,11 +469,12 @@ async def get_json(
     *,
     headers: dict[str, str] | None = None,
     timeout: float = 5.0,
+    verify_tls: bool | None = None,
 ) -> Any:
     """
     GET JSON from `url` and parse the response.
     """
-    return await request_json(url, headers=headers, timeout=timeout)
+    return await request_json(url, headers=headers, timeout=timeout, verify_tls=verify_tls)
 
 
 async def _post_empty(
@@ -408,6 +482,7 @@ async def _post_empty(
     *,
     headers: dict[str, str] | None = None,
     timeout: float = 5.0,
+    verify_tls: bool | None = None,
 ) -> None:
     """POST an empty body to ``url`` and discard the response."""
     await _request_body(
@@ -415,6 +490,7 @@ async def _post_empty(
         method="POST",
         headers=headers,
         timeout=timeout,
+        verify_tls=verify_tls,
     )
 
 

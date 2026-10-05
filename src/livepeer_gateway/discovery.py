@@ -10,7 +10,7 @@ from . import lp_rpc_pb2
 from .capabilities import capabilities_to_query
 from .errors import LivepeerGatewayError
 from .remote_signer import RemoteSignerError
-from .http import _http_origin, _parse_http_url, get_json, get_json_sync
+from .http import _http_origin, _parse_http_url, _tls_kwargs, get_json, get_json_sync
 
 _LOG = logging.getLogger(__name__)
 
@@ -70,6 +70,7 @@ def discover_orchestrators(
     discovery_url: str | None = None,
     discovery_headers: dict[str, str] | None = None,
     capabilities: lp_rpc_pb2.Capabilities | None = None,
+    verify_tls: bool | None = None,
 ) -> list[str]:
     """
     Discover orchestrators and return a list of addresses.
@@ -109,7 +110,7 @@ def discover_orchestrators(
 
     try:
         _LOG.debug("discover_orchestrators running discovery: %s", discovery_endpoint)
-        data = get_json_sync(discovery_endpoint, headers=request_headers)
+        data = get_json_sync(discovery_endpoint, headers=request_headers, **_tls_kwargs(verify_tls))
     except LivepeerGatewayError as e:
         _LOG.debug("discover_orchestrators discovery failed: %s", e)
         raise RemoteSignerError(
@@ -151,6 +152,7 @@ async def discover_runners(
     discovery_headers: dict[str, str] | None = None,
     app: FilterValue | None = None,
     gpu: FilterValue | None = None,
+    verify_tls: bool | None = None,
 ) -> list[dict[str, Any]]:
     """
     Discover live runners and return discovery entries.
@@ -158,6 +160,8 @@ async def discover_runners(
     Filters are composed as OR within each field and AND across fields.
     For example, app=["a", "b"], gpu=["H100", "L40S"] matches
     (app=a OR app=b) AND (gpu=H100 OR gpu=L40S).
+
+    ``verify_tls`` overrides ``livepeer_gateway.http.DEFAULT_VERIFY_TLS``.
     """
     if discovery_url:
         discovery_endpoint = _parse_http_url(discovery_url).geturl()
@@ -175,7 +179,7 @@ async def discover_runners(
 
     try:
         _LOG.debug("discover_runners running discovery: %s", discovery_endpoint)
-        data = await get_json(discovery_endpoint, headers=request_headers)
+        data = await get_json(discovery_endpoint, headers=request_headers, **_tls_kwargs(verify_tls))
     except LivepeerGatewayError as e:
         _LOG.debug("discover_runners discovery failed: %s", e)
         raise RemoteSignerError(
@@ -206,13 +210,18 @@ async def discover_orchestrator_runners(
     app: FilterValue | None = None,
     gpu: FilterValue | None = None,
     batch_size: int = _RUNNER_DISCOVERY_BATCH_SIZE,
+    verify_tls: bool | None = None,
 ) -> list[dict[str, Any]]:
     first_error: Exception | None = None
     urls = orchestrator_discovery_urls(orchestrators)
+    tls_kwargs = _tls_kwargs(verify_tls)
     for batch_start in range(0, len(urls), batch_size):
         batch = urls[batch_start : batch_start + batch_size]
         results = await asyncio.gather(
-            *(discover_runners(discovery_url=discovery_url, app=app, gpu=gpu) for discovery_url in batch),
+            *(
+                discover_runners(discovery_url=discovery_url, app=app, gpu=gpu, **tls_kwargs)
+                for discovery_url in batch
+            ),
             return_exceptions=True,
         )
         for discovery_url, result in zip(batch, results):
